@@ -1,7 +1,7 @@
 {
   "name": "server",
   "version": "1.0.0",
-  "description": "Realtime sync server for Atelier — broadcasts UI state and cursors to all connected clients",
+  "description": "Realtime sync server for Atelier — Socket.IO broadcast of UI state and cursors",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
@@ -9,6 +9,6 @@
     "dev": "node --watch index.js"
   },
   "dependencies": {
-    "ws": "^8.20.0"
+    "socket.io": "^4.8.1"
   }
 }

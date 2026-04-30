@@ -1,20 +1,23 @@
 const http = require('http')
-const crypto = require('crypto')
-const { WebSocketServer } = require('ws')
+const { Server } = require('socket.io')
 
 const PORT = Number(process.env.PORT) || 8787
 const HOST = process.env.HOST || '0.0.0.0'
+const ORIGIN = process.env.CORS_ORIGIN || '*'
 
 // Flat global state: dot-path -> value. Last-write-wins.
 const state = new Map()
 
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/health') {
-    res.writeHead(200, { 'content-type': 'application/json' })
+    res.writeHead(200, {
+      'content-type': 'application/json',
+      'access-control-allow-origin': '*',
+    })
     res.end(
       JSON.stringify({
         ok: true,
-        clients: wss.clients.size,
+        clients: io.engine.clientsCount,
         paths: state.size,
         uptime: process.uptime(),
       }),
@@ -25,114 +28,61 @@ const httpServer = http.createServer((req, res) => {
   res.end('not found')
 })
 
-const wss = new WebSocketServer({ server: httpServer })
+const io = new Server(httpServer, {
+  cors: { origin: ORIGIN, methods: ['GET', 'POST'] },
+  // Both transports — Socket.IO upgrades to WebSocket if it can,
+  // otherwise stays on HTTP long-polling. Survives broken WS upgrades at proxies.
+  transports: ['websocket', 'polling'],
+  pingInterval: 25000,
+  pingTimeout: 20000,
+})
 
-function broadcast(sender, payload) {
-  const msg = JSON.stringify(payload)
-  for (const client of wss.clients) {
-    if (client !== sender && client.readyState === 1) {
-      client.send(msg)
-    }
-  }
-}
-
-wss.on('connection', (ws) => {
-  const clientId = crypto.randomUUID()
-  ws.clientId = clientId
-
-  // Snapshot current state to the new client
+io.on('connection', (socket) => {
+  // Snapshot the entire shared state to the new client
   const snapshot = {}
   for (const [k, v] of state) snapshot[k] = v
-  ws.send(
-    JSON.stringify({
-      type: 'snapshot',
-      clientId,
-      state: snapshot,
-      peers: [...wss.clients]
-        .filter((c) => c !== ws && c.clientId)
-        .map((c) => c.clientId),
-    }),
-  )
+  socket.emit('snapshot', { clientId: socket.id, state: snapshot })
 
-  // Tell existing peers a new client joined
-  broadcast(ws, { type: 'peer-join', sender: clientId })
+  // Notify existing peers
+  socket.broadcast.emit('peer-join', { sender: socket.id })
 
-  ws.on('message', (raw) => {
-    let msg
-    try {
-      msg = JSON.parse(raw.toString())
-    } catch {
-      return
-    }
-    if (!msg || typeof msg !== 'object') return
-
-    if (msg.type === 'patch' && typeof msg.path === 'string') {
-      state.set(msg.path, msg.value)
-      broadcast(ws, {
-        type: 'patch',
-        path: msg.path,
-        value: msg.value,
-        sender: clientId,
-      })
-      return
-    }
-    if (msg.type === 'cursor') {
-      // Ephemeral — never stored
-      broadcast(ws, {
-        type: 'cursor',
-        sender: clientId,
-        x: msg.x,
-        y: msg.y,
-        vw: msg.vw,
-        vh: msg.vh,
-        name: msg.name,
-        color: msg.color,
-      })
-      return
-    }
-    if (msg.type === 'cursor-leave') {
-      broadcast(ws, { type: 'cursor-leave', sender: clientId })
-      return
-    }
-    if (msg.type === 'identity') {
-      ws.name = String(msg.name || '').slice(0, 40)
-      return
-    }
+  socket.on('patch', (msg) => {
+    if (!msg || typeof msg.path !== 'string') return
+    state.set(msg.path, msg.value)
+    socket.broadcast.emit('patch', {
+      path: msg.path,
+      value: msg.value,
+      sender: socket.id,
+    })
   })
 
-  ws.on('close', () => {
-    broadcast(ws, { type: 'peer-leave', sender: clientId })
+  socket.on('cursor', (msg) => {
+    if (!msg) return
+    socket.broadcast.emit('cursor', {
+      sender: socket.id,
+      x: Number(msg.x) || 0,
+      y: Number(msg.y) || 0,
+      vw: Number(msg.vw) || 1280,
+      vh: Number(msg.vh) || 720,
+      color: msg.color,
+      name: msg.name,
+    })
+  })
+
+  socket.on('cursor-leave', () => {
+    socket.broadcast.emit('cursor-leave', { sender: socket.id })
+  })
+
+  socket.on('disconnect', () => {
+    socket.broadcast.emit('peer-leave', { sender: socket.id })
   })
 })
 
 httpServer.listen(PORT, HOST, () => {
-  console.log(`[atelier-sync] ws://${HOST}:${PORT}`)
-})
-
-// Heartbeat — drop dead sockets so peer-leave fires
-const interval = setInterval(() => {
-  for (const ws of wss.clients) {
-    if (ws.isAlive === false) {
-      try {
-        ws.terminate()
-      } catch {}
-      continue
-    }
-    ws.isAlive = false
-    try {
-      ws.ping()
-    } catch {}
-  }
-}, 30000)
-
-wss.on('connection', (ws) => {
-  ws.isAlive = true
-  ws.on('pong', () => {
-    ws.isAlive = true
-  })
+  console.log(`[atelier-sync] http://${HOST}:${PORT}  (Socket.IO)`)
 })
 
 process.on('SIGINT', () => {
-  clearInterval(interval)
+  io.close()
   httpServer.close(() => process.exit(0))
 })
