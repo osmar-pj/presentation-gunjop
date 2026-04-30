@@ -1,8 +1,18 @@
-// Realtime sync — connects to the WebSocket server and exposes:
-//   • <SyncProvider>  — wraps the app, manages the WS connection
+// Realtime sync — Socket.IO transport.
+//
+// Public API (unchanged from the WebSocket implementation):
+//   • <SyncProvider>  — wraps the app, manages the connection
 //   • useShared(path) — useState-shaped hook backed by the shared store
 //   • useSync()       — low-level access (cursors, presence, raw set/get)
 //   • <RemoteCursors> — overlay rendering pointers of other connected users
+//   • <SyncStatus>    — small connection badge
+//   • useWindowScrollSync() — sync window scroll across clients
+//
+// Why Socket.IO (vs raw WebSocket):
+//   • Auto-falls-back to HTTP long-polling if WS upgrade fails (e.g., proxy
+//     mishandles `Connection: Upgrade`). Communication keeps working.
+//   • Built-in reconnection with backoff.
+//   • The URL is just `https://your-server` — no need to think about wss vs ws.
 
 import {
   createContext,
@@ -15,12 +25,13 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from 'react'
+import { io, type Socket } from 'socket.io-client'
 
 const SYNC_URL: string =
   (import.meta.env?.VITE_SYNC_URL as string | undefined) ??
   (typeof window !== 'undefined'
-    ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:8787`
-    : 'ws://localhost:8787')
+    ? `${window.location.protocol}//${window.location.hostname}:8787`
+    : 'http://localhost:8787')
 
 const PALETTE = [
   '#c1432a', '#8e6f2c', '#3a5a72', '#5b6e4f',
@@ -59,14 +70,18 @@ type SyncCtx = {
 
 const SyncContext = createContext<SyncCtx | null>(null)
 
+type PatchMsg = { path: string; value: unknown; sender?: string }
+type CursorMsg = { sender: string; x: number; y: number; vw: number; vh: number; color?: string; name?: string }
+type PeerMsg = { sender: string }
+type SnapshotMsg = { clientId: string; state: Record<string, unknown> }
+
 export function SyncProvider({ children }: { children: ReactNode }) {
   const stateRef = useRef<Map<string, unknown>>(new Map())
   const listenersRef = useRef<Map<string, Set<() => void>>>(new Map())
   const cursorsRef = useRef<Map<string, RemoteCursor>>(new Map())
   const cursorSnapshotRef = useRef<RemoteCursor[]>([])
   const cursorListenersRef = useRef<Set<() => void>>(new Set())
-  const wsRef = useRef<WebSocket | null>(null)
-  const pendingRef = useRef<string[]>([])
+  const socketRef = useRef<Socket | null>(null)
 
   const [clientId, setClientId] = useState<string | null>(null)
   const [connected, setConnected] = useState(false)
@@ -76,108 +91,67 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     if (ls) ls.forEach((l) => l())
   }, [])
 
-  // Rebuild cached snapshot so getCursors() can return a stable reference
-  // until the underlying data actually changes (required by useSyncExternalStore).
+  // Rebuild cached snapshot so getCursors() returns a stable reference
+  // until something actually changes (required by useSyncExternalStore).
   const notifyCursors = useCallback(() => {
     cursorSnapshotRef.current = Array.from(cursorsRef.current.values())
     cursorListenersRef.current.forEach((l) => l())
   }, [])
 
-  // WebSocket lifecycle
+  // Socket lifecycle
   useEffect(() => {
-    let alive = true
-    let backoff = 400
-    let reconnectTimer: number | null = null
+    const socket = io(SYNC_URL, {
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionDelay: 400,
+      reconnectionDelayMax: 20000,
+      withCredentials: false,
+    })
+    socketRef.current = socket
 
-    const flushPending = () => {
-      const ws = wsRef.current
-      if (!ws || ws.readyState !== 1) return
-      const queue = pendingRef.current
-      pendingRef.current = []
-      for (const m of queue) ws.send(m)
-    }
+    socket.on('connect', () => setConnected(true))
+    socket.on('disconnect', () => setConnected(false))
+    // Don't blow up the page on transient errors; Socket.IO will retry.
+    socket.on('connect_error', () => {})
 
-    const connect = () => {
-      let ws: WebSocket
-      try {
-        ws = new WebSocket(SYNC_URL)
-      } catch {
-        if (alive) reconnectTimer = window.setTimeout(connect, backoff)
-        return
+    socket.on('snapshot', (msg: SnapshotMsg) => {
+      setClientId(msg.clientId ?? null)
+      const remote = msg.state ?? {}
+      for (const k of Object.keys(remote)) {
+        stateRef.current.set(k, remote[k])
+        notifyPath(k)
       }
-      wsRef.current = ws
+    })
 
-      ws.addEventListener('open', () => {
-        backoff = 400
-        setConnected(true)
-        flushPending()
+    socket.on('patch', (msg: PatchMsg) => {
+      if (!msg || typeof msg.path !== 'string') return
+      stateRef.current.set(msg.path, msg.value)
+      notifyPath(msg.path)
+    })
+
+    socket.on('cursor', (msg: CursorMsg) => {
+      if (!msg || typeof msg.sender !== 'string') return
+      cursorsRef.current.set(msg.sender, {
+        id: msg.sender,
+        x: Number(msg.x) || 0,
+        y: Number(msg.y) || 0,
+        vw: Number(msg.vw) || 1280,
+        vh: Number(msg.vh) || 720,
+        color: msg.color || colorFor(msg.sender),
+        name: msg.name,
+        updatedAt: Date.now(),
       })
+      notifyCursors()
+    })
 
-      ws.addEventListener('close', () => {
-        setConnected(false)
-        if (wsRef.current === ws) wsRef.current = null
-        if (alive) {
-          reconnectTimer = window.setTimeout(connect, backoff)
-          backoff = Math.min(backoff * 1.8, 20000)
-        }
-      })
-
-      ws.addEventListener('error', () => {
-        try { ws.close() } catch { /* noop */ }
-      })
-
-      ws.addEventListener('message', (e) => {
-        let msg: { type?: string; [k: string]: unknown }
-        try { msg = JSON.parse(e.data as string) } catch { return }
-        if (!msg || typeof msg !== 'object') return
-
-        if (msg.type === 'snapshot') {
-          setClientId((msg.clientId as string) ?? null)
-          const remote = (msg.state ?? {}) as Record<string, unknown>
-          // Merge: keep any local values the client already optimistically set,
-          // overwrite with server values for everything else.
-          for (const k of Object.keys(remote)) {
-            stateRef.current.set(k, remote[k])
-            notifyPath(k)
-          }
-          return
-        }
-
-        if (msg.type === 'patch' && typeof msg.path === 'string') {
-          stateRef.current.set(msg.path, msg.value)
-          notifyPath(msg.path)
-          return
-        }
-
-        if (msg.type === 'cursor' && typeof msg.sender === 'string') {
-          const id = msg.sender as string
-          cursorsRef.current.set(id, {
-            id,
-            x: Number(msg.x) || 0,
-            y: Number(msg.y) || 0,
-            vw: Number(msg.vw) || 1280,
-            vh: Number(msg.vh) || 720,
-            color: (msg.color as string) || colorFor(id),
-            name: typeof msg.name === 'string' ? msg.name : undefined,
-            updatedAt: Date.now(),
-          })
-          notifyCursors()
-          return
-        }
-
-        if (
-          (msg.type === 'cursor-leave' || msg.type === 'peer-leave') &&
-          typeof msg.sender === 'string'
-        ) {
-          if (cursorsRef.current.delete(msg.sender as string)) notifyCursors()
-          return
-        }
-      })
+    const removePeer = (msg: PeerMsg) => {
+      if (!msg?.sender) return
+      if (cursorsRef.current.delete(msg.sender)) notifyCursors()
     }
+    socket.on('cursor-leave', removePeer)
+    socket.on('peer-leave', removePeer)
 
-    connect()
-
-    // Sweep stale cursors (in case a client disconnects without close event)
+    // Sweep stale cursors (defensive — server should fire peer-leave on disconnect)
     const sweep = window.setInterval(() => {
       const now = Date.now()
       let changed = false
@@ -191,10 +165,10 @@ export function SyncProvider({ children }: { children: ReactNode }) {
     }, 1500)
 
     return () => {
-      alive = false
-      if (reconnectTimer) window.clearTimeout(reconnectTimer)
       window.clearInterval(sweep)
-      try { wsRef.current?.close() } catch { /* noop */ }
+      socket.removeAllListeners()
+      socket.disconnect()
+      socketRef.current = null
     }
   }, [notifyPath, notifyCursors])
 
@@ -207,10 +181,8 @@ export function SyncProvider({ children }: { children: ReactNode }) {
       // Optimistic local update
       stateRef.current.set(path, value)
       notifyPath(path)
-      const payload = JSON.stringify({ type: 'patch', path, value })
-      const ws = wsRef.current
-      if (ws && ws.readyState === 1) ws.send(payload)
-      else pendingRef.current.push(payload)
+      // Emit (Socket.IO buffers messages while disconnected by default)
+      socketRef.current?.emit('patch', { path, value })
     },
     subscribe: (path, listener) => {
       let s = listenersRef.current.get(path)
@@ -219,20 +191,19 @@ export function SyncProvider({ children }: { children: ReactNode }) {
       return () => { s!.delete(listener) }
     },
     sendCursor: (x, y) => {
-      const ws = wsRef.current
-      if (!ws || ws.readyState !== 1) return
-      ws.send(JSON.stringify({
-        type: 'cursor',
+      const sock = socketRef.current
+      if (!sock || !sock.connected) return
+      sock.emit('cursor', {
         x, y,
         vw: window.innerWidth,
         vh: window.innerHeight,
         color: clientId ? colorFor(clientId) : PALETTE[0],
-      }))
+      })
     },
     sendCursorLeave: () => {
-      const ws = wsRef.current
-      if (!ws || ws.readyState !== 1) return
-      ws.send(JSON.stringify({ type: 'cursor-leave' }))
+      const sock = socketRef.current
+      if (!sock || !sock.connected) return
+      sock.emit('cursor-leave')
     },
     subscribeCursors: (listener) => {
       cursorListenersRef.current.add(listener)
